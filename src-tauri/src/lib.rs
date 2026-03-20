@@ -368,28 +368,54 @@ fn start_backend(app: &AppHandle) -> Result<Child, String> {
         .map_err(|e| format!("No app data dir: {}", e))?;
     std::fs::create_dir_all(&data_dir).ok();
 
-    let child = Command::new(&node)
-        .arg(&backend_entry)
+    let mut cmd = Command::new(&node);
+    cmd.arg(&backend_entry)
         .env("DATA_DIR", data_dir.join("store").to_str().unwrap_or(""))
         .env("GROUPS_DIR", data_dir.join("groups").to_str().unwrap_or(""))
         .env("LOGS_DIR", data_dir.join("logs").to_str().unwrap_or(""))
         .env("PORT", "4100")
-        .env("NODE_ENV", "production")
-        .spawn()
+        .env("NODE_ENV", "production");
+
+    // Pass Claude OAuth token to local backend so it can call Claude API
+    if let Some(creds) = read_creds_from_keyring(app) {
+        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", &creds.access_token);
+    }
+
+    let child = cmd.spawn()
         .map_err(|e| format!("Failed to start backend: {}", e))?;
 
     Ok(child)
 }
 
 fn which_node() -> Option<String> {
-    for path in &["/usr/local/bin/node", "/usr/bin/node", "/opt/homebrew/bin/node"] {
+    // Platform-specific hardcoded paths
+    #[cfg(target_os = "windows")]
+    let candidates: &[&str] = &[
+        "C:\\Program Files\\nodejs\\node.exe",
+        "C:\\Program Files (x86)\\nodejs\\node.exe",
+    ];
+    #[cfg(not(target_os = "windows"))]
+    let candidates: &[&str] = &[
+        "/usr/local/bin/node",
+        "/usr/bin/node",
+        "/opt/homebrew/bin/node",
+    ];
+
+    for path in candidates {
         if std::path::Path::new(path).exists() {
             return Some(path.to_string());
         }
     }
-    Command::new("which").arg("node").output().ok()
+
+    // Fall back to PATH lookup — `where` on Windows, `which` on Unix
+    #[cfg(target_os = "windows")]
+    let lookup = Command::new("where").arg("node").output().ok();
+    #[cfg(not(target_os = "windows"))]
+    let lookup = Command::new("which").arg("node").output().ok();
+
+    lookup
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
+        .map(|s| s.lines().next().unwrap_or("").trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
@@ -575,23 +601,38 @@ pub fn run() {
             // Start background token sync loop
             start_token_sync_loop(handle.clone());
 
-            // Push current token to server on startup (3s delay to let app settle)
+            // Push current token to server on startup — retry up to 5 times with backoff
             {
                 let startup_handle = handle.clone();
                 thread::spawn(move || {
                     thread::sleep(Duration::from_secs(3));
-                    if let (Some(creds), Some(config)) = (
-                        read_creds_from_keyring(&startup_handle),
-                        read_bridge_config_from_keyring(&startup_handle),
-                    ) {
+                    let creds = match read_creds_from_keyring(&startup_handle) {
+                        Some(c) => c,
+                        None => return,
+                    };
+                    let config = match read_bridge_config_from_keyring(&startup_handle) {
+                        Some(c) => c,
+                        None => return,
+                    };
+
+                    let mut last_err = String::new();
+                    for attempt in 0u64..5 {
+                        if attempt > 0 {
+                            // Exponential backoff: 5s, 10s, 20s, 40s
+                            thread::sleep(Duration::from_secs(5 * (1 << (attempt - 1))));
+                        }
                         match push_token_to_server_blocking(&config.server_url, &config.bridge_token, &creds) {
-                            Ok(()) => { let _ = startup_handle.emit("token-synced", creds.expires_at); }
+                            Ok(()) => {
+                                let _ = startup_handle.emit("token-synced", creds.expires_at);
+                                return;
+                            }
                             Err(e) => {
-                                eprintln!("[startup] Token push failed: {}", e);
-                                let _ = startup_handle.emit("token-sync-failed", e);
+                                eprintln!("[startup] Token push attempt {} failed: {}", attempt + 1, e);
+                                last_err = e;
                             }
                         }
                     }
+                    let _ = startup_handle.emit("token-sync-failed", last_err);
                 });
             }
 
