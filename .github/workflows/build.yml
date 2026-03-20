@@ -1,0 +1,100 @@
+name: Build Sam Desktop
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: Sam_0.1.0_x64-setup.exe
+            bundle_path: src-tauri/target/release/bundle/nsis/Sam_0.1.0_x64-setup.exe
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            artifact: Sam_0.1.0_aarch64.dmg
+            bundle_path: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/Sam_0.1.0_aarch64.dmg
+          - platform: macos-13
+            target: x86_64-apple-darwin
+            artifact: Sam_0.1.0_x64.dmg
+            bundle_path: src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/Sam_0.1.0_x64.dmg
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tauriScript: npx tauri
+          args: --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.bundle_path }}
+          if-no-files-found: warn
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Download Windows exe
+        uses: actions/download-artifact@v4
+        with:
+          name: Sam_0.1.0_x64-setup.exe
+          path: ./downloads/
+
+      - name: Download macOS ARM dmg
+        uses: actions/download-artifact@v4
+        with:
+          name: Sam_0.1.0_aarch64.dmg
+          path: ./downloads/
+
+      - name: Upload to server
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan 187.77.144.238 >> ~/.ssh/known_hosts 2>/dev/null
+
+          # Copy Windows exe
+          if [ -f downloads/Sam_0.1.0_x64-setup.exe ]; then
+            scp downloads/Sam_0.1.0_x64-setup.exe root@187.77.144.238:/docker/sam/public/downloads/SamBridge_setup.exe
+            echo "Windows exe deployed"
+          fi
+
+          # Copy macOS DMG
+          if [ -f downloads/Sam_0.1.0_aarch64.dmg ]; then
+            scp downloads/Sam_0.1.0_aarch64.dmg root@187.77.144.238:/docker/sam/public/downloads/SamBridge_latest_macos.dmg
+            echo "macOS DMG deployed"
+          fi
+
+          # Rebuild to include new static files
+          ssh root@187.77.144.238 "cd /docker/sam && docker compose up -d --build sam"
