@@ -1,188 +1,134 @@
-use std::process::{Command, Child};
-use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 use tauri::{Manager, AppHandle, Emitter};
-use tauri::menu::{MenuBuilder, SubmenuBuilder, MenuItemBuilder, PredefinedMenuItem};
-use tauri_plugin_updater::UpdaterExt;
-use tauri_plugin_keyring::KeyringExt;
+use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::tray::TrayIconEvent;
 
-// ── Constants ──────────────────────────────────────────────────────────────
-
-const KEYRING_SERVICE: &str = "Sam-Claude-OAuth";
-const KEYRING_ACCOUNT: &str = "credentials";
 const OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const TOKEN_ENDPOINT: &str = "https://console.anthropic.com/v1/oauth/token";
-const REFRESH_THRESHOLD_SECS: u64 = 2 * 3600; // refresh when < 2h remaining
-const CHECK_INTERVAL_SECS: u64 = 30 * 60;     // check every 30 minutes
+const REFRESH_THRESHOLD_SECS: u64 = 2 * 3600;
+const CHECK_INTERVAL_SECS: u64 = 30 * 60;
 
-// ── Managed state ──────────────────────────────────────────────────────────
-
-struct BackendProcess(Mutex<Option<Child>>);
-
-/// Claude credentials stored in keyring
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-pub struct ClaudeCreds {
-    pub access_token: String,
-    pub refresh_token: String,
-    pub expires_at: u64, // Unix ms
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+pub struct AppConfig {
+    #[serde(default)] pub server_url: String,
+    #[serde(default)] pub bridge_token: String,
+    #[serde(default)] pub access_token: String,
+    #[serde(default)] pub refresh_token: String,
+    #[serde(default)] pub expires_at: u64,
 }
 
-/// Bridge connection config
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-pub struct BridgeConfig {
-    pub server_url: String,
-    pub bridge_token: String,
+// ── File-based config (no Keychain) ──
+
+fn config_path() -> std::path::PathBuf {
+    let dir = dirs::config_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default()).join("Sam");
+    std::fs::create_dir_all(&dir).ok();
+    dir.join("config.json")
 }
 
-// ── Keyring helpers ────────────────────────────────────────────────────────
-
-fn read_creds_from_keyring(app: &AppHandle) -> Option<ClaudeCreds> {
-    let keyring = app.keyring();
-    let raw = keyring.get(KEYRING_SERVICE, KEYRING_ACCOUNT).ok()??;
-    serde_json::from_str(&raw).ok()
+fn read_config() -> AppConfig {
+    std::fs::read_to_string(config_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
-fn write_creds_to_keyring(app: &AppHandle, creds: &ClaudeCreds) -> Result<(), String> {
-    let keyring = app.keyring();
-    let json = serde_json::to_string(creds).map_err(|e| e.to_string())?;
-    keyring.set(KEYRING_SERVICE, KEYRING_ACCOUNT, &json).map_err(|e| e.to_string())?;
-    Ok(())
+fn write_config(config: &AppConfig) -> Result<(), String> {
+    std::fs::write(config_path(), serde_json::to_string_pretty(config).unwrap_or_default())
+        .map_err(|e| e.to_string())
 }
 
-fn read_bridge_config_from_keyring(app: &AppHandle) -> Option<BridgeConfig> {
-    let keyring = app.keyring();
-    let raw = keyring.get("Sam-Bridge-Config", "default").ok()??;
-    serde_json::from_str(&raw).ok()
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
-fn write_bridge_config_to_keyring(app: &AppHandle, config: &BridgeConfig) -> Result<(), String> {
-    let keyring = app.keyring();
-    let json = serde_json::to_string(config).map_err(|e| e.to_string())?;
-    keyring.set("Sam-Bridge-Config", "default", &json).map_err(|e| e.to_string())?;
-    Ok(())
-}
+// ── Token refresh ──
 
-// ── Token refresh (blocking) ───────────────────────────────────────────────
-
-fn refresh_token_blocking(refresh_token: &str) -> Result<ClaudeCreds, String> {
-    let params = [
-        ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token),
-        ("client_id", OAUTH_CLIENT_ID),
-    ];
-
+fn refresh_token_blocking(refresh_token: &str) -> Result<(String, String, u64), String> {
     let client = reqwest::blocking::Client::new();
-    let response = client
-        .post(TOKEN_ENDPOINT)
+    let response = client.post(TOKEN_ENDPOINT)
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .form(&params)
-        .send()
-        .map_err(|e| format!("Network error: {}", e))?;
+        .form(&[("grant_type", "refresh_token"), ("refresh_token", refresh_token), ("client_id", OAUTH_CLIENT_ID)])
+        .send().map_err(|e| format!("Network error: {}", e))?;
 
     if !response.status().is_success() {
-        let status = response.status();
         let body = response.text().unwrap_or_default();
-        return Err(format!("Refresh failed ({}): {}", status, body));
+        return Err(format!("Refresh failed: {}", body));
     }
 
     let data: serde_json::Value = response.json().map_err(|e| e.to_string())?;
-
-    let access_token = data["access_token"].as_str().ok_or("Missing access_token")?.to_string();
-    let new_refresh = data["refresh_token"].as_str().ok_or("Missing refresh_token")?.to_string();
-    let expires_in = data["expires_in"].as_u64().unwrap_or(28800);
-
-    let expires_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-        + expires_in * 1000;
-
-    Ok(ClaudeCreds { access_token, refresh_token: new_refresh, expires_at })
+    Ok((
+        data["access_token"].as_str().ok_or("Missing access_token")?.to_string(),
+        data["refresh_token"].as_str().ok_or("Missing refresh_token")?.to_string(),
+        now_ms() + data["expires_in"].as_u64().unwrap_or(28800) * 1000,
+    ))
 }
 
-// ── Push token to server (blocking) ───────────────────────────────────────
+// ── Push token to server ──
 
-fn push_token_to_server_blocking(server_url: &str, bridge_token: &str, creds: &ClaudeCreds) -> Result<(), String> {
-    let url = format!("{}/api/bridge/claude-token", server_url.trim_end_matches('/'));
-
-    let body = serde_json::json!({
-        "accessToken": creds.access_token,
-        "refreshToken": creds.refresh_token,
-        "expiresAt": creds.expires_at,
-    });
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let response = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", bridge_token))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .map_err(|e| format!("Network error pushing token: {}", e))?;
-
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        Err(format!("Server rejected token ({}): {}", status, body))
+fn push_token(config: &AppConfig) -> Result<(), String> {
+    if config.server_url.is_empty() || config.bridge_token.is_empty() || config.access_token.is_empty() {
+        return Err("Missing config".into());
     }
+    let url = format!("{}/api/bridge/claude-token", config.server_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(10)).build().map_err(|e| e.to_string())?;
+    let response = client.post(&url)
+        .header("Authorization", format!("Bearer {}", config.bridge_token))
+        .json(&serde_json::json!({ "accessToken": config.access_token, "refreshToken": config.refresh_token, "expiresAt": config.expires_at }))
+        .send().map_err(|e| format!("Push failed: {}", e))?;
+    if response.status().is_success() { Ok(()) } else { Err(format!("Server rejected ({})", response.status())) }
 }
 
-// ── Auto-detect Claude CLI credentials ────────────────────────────────────
+// ── Auto-detect Claude CLI creds from file ──
 
-fn read_claude_cli_creds() -> Option<ClaudeCreds> {
-    let candidates: Vec<std::path::PathBuf> = {
-        let mut paths = vec![];
+struct FoundCreds {
+    access_token: String,
+    refresh_token: String,
+    expires_at: u64,
+    source: String,
+}
 
-        // Windows: %APPDATA%\Claude Code\ or %LOCALAPPDATA%\AnthropicClaude\
-        if let Some(appdata) = dirs::config_dir() {
-            paths.push(appdata.join("Claude Code").join("credentials.json"));
-            paths.push(appdata.join("claude").join("credentials.json"));
-            paths.push(appdata.join("AnthropicClaude").join("credentials.json"));
+fn detect_cli_creds() -> Option<FoundCreds> {
+    // 1. Try macOS Keychain via `security` CLI (no password prompt)
+    if let Ok(output) = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .output()
+    {
+        if output.status.success() {
+            let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(creds) = extract_oauth(&json, "macOS Keychain (Claude Code-credentials)") {
+                    return Some(creds);
+                }
+            }
         }
+    }
 
-        // macOS/Linux: ~/.config/claude/
-        if let Some(home) = dirs::home_dir() {
-            paths.push(home.join(".config").join("claude").join("credentials.json"));
-            paths.push(home.join(".claude").join("credentials.json"));
-        }
+    // 2. Try credential files (macOS + Linux + Windows paths)
+    let mut paths = vec![];
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".claude").join("credentials.json"));
+        paths.push(home.join(".config").join("claude").join("credentials.json"));
+    }
+    if let Some(cfg) = dirs::config_dir() {
+        // Windows: %APPDATA%\Claude Code\credentials.json
+        paths.push(cfg.join("Claude Code").join("credentials.json"));
+        // Windows alt: %APPDATA%\claude\credentials.json
+        paths.push(cfg.join("claude").join("credentials.json"));
+        // Windows alt: %APPDATA%\AnthropicClaude\credentials.json
+        paths.push(cfg.join("AnthropicClaude").join("credentials.json"));
+    }
+    if let Some(local) = dirs::data_local_dir() {
+        // Windows: %LOCALAPPDATA%\AnthropicClaude\credentials.json
+        paths.push(local.join("AnthropicClaude").join("credentials.json"));
+    }
 
-        paths
-    };
-
-    for path in &candidates {
-        if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                    let access = json["claudeAiOauth"]["accessToken"].as_str()
-                        .or_else(|| json["access_token"].as_str())
-                        .or_else(|| json["accessToken"].as_str())
-                        .map(|s| s.to_string());
-
-                    let refresh = json["claudeAiOauth"]["refreshToken"].as_str()
-                        .or_else(|| json["refresh_token"].as_str())
-                        .or_else(|| json["refreshToken"].as_str())
-                        .map(|s| s.to_string());
-
-                    let expires = json["claudeAiOauth"]["expiresAt"].as_u64()
-                        .or_else(|| json["expires_at"].as_u64());
-
-                    if let (Some(access), Some(refresh)) = (access, refresh) {
-                        let expires_at = expires.unwrap_or_else(|| {
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64
-                                + 8 * 3600 * 1000
-                        });
-                        return Some(ClaudeCreds { access_token: access, refresh_token: refresh, expires_at });
-                    }
+    for path in &paths {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                let source = format!("File: {}", path.display());
+                if let Some(creds) = extract_oauth(&json, &source) {
+                    return Some(creds);
                 }
             }
         }
@@ -190,486 +136,214 @@ fn read_claude_cli_creds() -> Option<ClaudeCreds> {
     None
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+fn extract_oauth(json: &serde_json::Value, source: &str) -> Option<FoundCreds> {
+    let access = json["claudeAiOauth"]["accessToken"].as_str()
+        .or_else(|| json["accessToken"].as_str()).map(|s| s.to_string())?;
+    let refresh = json["claudeAiOauth"]["refreshToken"].as_str()
+        .or_else(|| json["refreshToken"].as_str()).map(|s| s.to_string()).unwrap_or_default();
+    let expires = json["claudeAiOauth"]["expiresAt"].as_u64().unwrap_or(0);
+
+    Some(FoundCreds { access_token: access, refresh_token: refresh, expires_at: expires, source: source.to_string() })
 }
 
-// ── Background sync loop ───────────────────────────────────────────────────
+// ── Background sync loop ──
 
-fn start_token_sync_loop(app: AppHandle) {
+fn start_sync_loop(app: AppHandle) {
     thread::spawn(move || {
+        // Initial push after 3s
+        thread::sleep(Duration::from_secs(3));
+        let config = read_config();
+        if !config.access_token.is_empty() && !config.server_url.is_empty() {
+            for attempt in 0u64..3 {
+                if attempt > 0 { thread::sleep(Duration::from_secs(5)); }
+                if push_token(&config).is_ok() {
+                    let _ = app.emit("token-synced", config.expires_at);
+                    break;
+                }
+            }
+        }
+
+        // Periodic loop
         loop {
             thread::sleep(Duration::from_secs(CHECK_INTERVAL_SECS));
+            let mut config = read_config();
+            if config.access_token.is_empty() || config.server_url.is_empty() { continue; }
 
-            let creds = match read_creds_from_keyring(&app) {
-                Some(c) => c,
-                None => continue,
-            };
-
-            let config = match read_bridge_config_from_keyring(&app) {
-                Some(c) => c,
-                None => continue,
-            };
-
-            let remaining_secs = creds.expires_at.saturating_sub(now_ms()) / 1000;
-
-            let creds_to_push = if remaining_secs < REFRESH_THRESHOLD_SECS {
-                match refresh_token_blocking(&creds.refresh_token) {
-                    Ok(new_creds) => {
-                        let _ = write_creds_to_keyring(&app, &new_creds);
-                        let _ = app.emit("token-refreshed", new_creds.expires_at);
-                        new_creds
+            let remaining = config.expires_at.saturating_sub(now_ms()) / 1000;
+            if remaining < REFRESH_THRESHOLD_SECS && !config.refresh_token.is_empty() {
+                match refresh_token_blocking(&config.refresh_token) {
+                    Ok((a, r, e)) => {
+                        config.access_token = a;
+                        config.refresh_token = r;
+                        config.expires_at = e;
+                        let _ = write_config(&config);
+                        let _ = app.emit("token-refreshed", config.expires_at);
                     }
-                    Err(e) => {
-                        eprintln!("[token-sync] Refresh failed: {}", e);
-                        let _ = app.emit("token-refresh-failed", e);
-                        continue;
-                    }
+                    Err(e) => { let _ = app.emit("token-sync-failed", e); continue; }
                 }
-            } else {
-                creds
-            };
+            }
 
-            match push_token_to_server_blocking(&config.server_url, &config.bridge_token, &creds_to_push) {
-                Ok(()) => { let _ = app.emit("token-synced", creds_to_push.expires_at); }
-                Err(e) => {
-                    eprintln!("[token-sync] Push failed: {}", e);
-                    let _ = app.emit("token-sync-failed", e);
-                }
+            match push_token(&config) {
+                Ok(()) => { let _ = app.emit("token-synced", config.expires_at); }
+                Err(e) => { let _ = app.emit("token-sync-failed", e); }
             }
         }
     });
 }
 
-// ── Tauri commands ─────────────────────────────────────────────────────────
+// ── Commands ──
 
 #[tauri::command]
-fn save_claude_creds(
-    app: AppHandle,
-    access_token: String,
-    refresh_token: String,
-    expires_at: u64,
-) -> Result<String, String> {
-    let creds = ClaudeCreds { access_token, refresh_token, expires_at };
-    write_creds_to_keyring(&app, &creds)?;
+fn get_server_url() -> String { read_config().server_url }
 
-    if let Some(config) = read_bridge_config_from_keyring(&app) {
-        match push_token_to_server_blocking(&config.server_url, &config.bridge_token, &creds) {
-            Ok(()) => return Ok("Credentials saved and synced to server".to_string()),
-            Err(e) => eprintln!("[save_claude_creds] Push failed (will retry): {}", e),
-        }
+#[tauri::command]
+fn get_bridge_token() -> String { read_config().bridge_token }
+
+#[tauri::command]
+fn save_config(server_url: String, bridge_token: Option<String>) -> Result<(), String> {
+    let mut config = read_config();
+    config.server_url = server_url;
+    if let Some(t) = bridge_token { config.bridge_token = t; }
+    write_config(&config)
+}
+
+#[tauri::command]
+fn get_claude_status() -> serde_json::Value {
+    let config = read_config();
+    if config.access_token.is_empty() {
+        return serde_json::json!({ "connected": false, "hasServerConfig": !config.server_url.is_empty() });
     }
-
-    Ok("Credentials saved locally".to_string())
-}
-
-#[tauri::command]
-fn save_bridge_config(app: AppHandle, server_url: String, bridge_token: String) -> Result<(), String> {
-    write_bridge_config_to_keyring(&app, &BridgeConfig { server_url, bridge_token })
-}
-
-#[tauri::command]
-fn get_claude_status(app: AppHandle) -> serde_json::Value {
-    let creds = read_creds_from_keyring(&app);
-    let config = read_bridge_config_from_keyring(&app);
     let now = now_ms();
-
-    match creds {
-        Some(c) => {
-            let hours_remaining = if c.expires_at > now {
-                ((c.expires_at - now) as f64 / 3_600_000.0 * 10.0).round() / 10.0
-            } else {
-                0.0
-            };
-            serde_json::json!({
-                "connected": true,
-                "hasServerConfig": config.is_some(),
-                "expiresAt": c.expires_at,
-                "hoursRemaining": hours_remaining,
-                "isExpired": c.expires_at < now,
-                "needsRefresh": c.expires_at < now + REFRESH_THRESHOLD_SECS * 1000,
-            })
-        }
-        None => serde_json::json!({ "connected": false, "hasServerConfig": config.is_some() }),
-    }
+    let hrs = if config.expires_at > now { ((config.expires_at - now) as f64 / 3_600_000.0 * 10.0).round() / 10.0 } else { 0.0 };
+    serde_json::json!({ "connected": true, "hasServerConfig": !config.server_url.is_empty(), "expiresAt": config.expires_at, "hoursRemaining": hrs, "isExpired": config.expires_at < now })
 }
 
 #[tauri::command]
-fn detect_claude_creds(app: AppHandle) -> Result<serde_json::Value, String> {
-    match read_claude_cli_creds() {
+fn detect_claude_creds() -> Result<serde_json::Value, String> {
+    match detect_cli_creds() {
         Some(creds) => {
-            write_creds_to_keyring(&app, &creds)?;
             let now = now_ms();
-            let hours = ((creds.expires_at.saturating_sub(now)) as f64 / 3_600_000.0 * 10.0).round() / 10.0;
-            Ok(serde_json::json!({ "found": true, "expiresAt": creds.expires_at, "hoursRemaining": hours }))
+            let expired = creds.expires_at < now;
+            let hrs = if !expired { ((creds.expires_at - now) as f64 / 3_600_000.0 * 10.0).round() / 10.0 } else { 0.0 };
+            let token_preview = if creds.access_token.len() > 20 {
+                format!("{}...{}", &creds.access_token[..15], &creds.access_token[creds.access_token.len()-4..])
+            } else { creds.access_token.clone() };
+
+            // Don't save yet — just report what was found
+            Ok(serde_json::json!({
+                "found": true,
+                "source": creds.source,
+                "tokenPreview": token_preview,
+                "hoursRemaining": hrs,
+                "expired": expired,
+                "hasRefreshToken": !creds.refresh_token.is_empty(),
+                // Pass the actual tokens back so the UI can trigger save
+                "accessToken": creds.access_token,
+                "refreshToken": creds.refresh_token,
+                "expiresAt": creds.expires_at,
+            }))
         }
         None => Ok(serde_json::json!({ "found": false })),
     }
 }
 
 #[tauri::command]
-fn force_token_refresh(app: AppHandle) -> Result<serde_json::Value, String> {
-    let creds = read_creds_from_keyring(&app)
-        .ok_or("No credentials stored. Connect Claude account first.")?;
-
-    let new_creds = refresh_token_blocking(&creds.refresh_token)
-        .map_err(|e| format!("Refresh failed: {}", e))?;
-
-    write_creds_to_keyring(&app, &new_creds)?;
-
-    let now = now_ms();
-    let hours = ((new_creds.expires_at.saturating_sub(now)) as f64 / 3_600_000.0 * 10.0).round() / 10.0;
-
-    let server_synced = if let Some(config) = read_bridge_config_from_keyring(&app) {
-        push_token_to_server_blocking(&config.server_url, &config.bridge_token, &new_creds).is_ok()
-    } else {
-        false
-    };
-
-    Ok(serde_json::json!({
-        "success": true,
-        "expiresAt": new_creds.expires_at,
-        "hoursRemaining": hours,
-        "serverSynced": server_synced,
-    }))
-}
-
-#[tauri::command]
-fn push_token_now(app: AppHandle) -> Result<String, String> {
-    let creds = read_creds_from_keyring(&app)
-        .ok_or("No credentials. Connect Claude account first.")?;
-    let config = read_bridge_config_from_keyring(&app)
-        .ok_or("No server config. Complete setup first.")?;
-
-    push_token_to_server_blocking(&config.server_url, &config.bridge_token, &creds)
-        .map_err(|e| e.to_string())?;
-
-    Ok("Token synced to server".to_string())
-}
-
-#[tauri::command]
-fn disconnect_claude(app: AppHandle) -> Result<(), String> {
-    let keyring = app.keyring();
-    let _ = keyring.delete(KEYRING_SERVICE, KEYRING_ACCOUNT);
-    Ok(())
-}
-
-// ── Existing commands ──────────────────────────────────────────────────────
-
-fn start_backend(app: &AppHandle) -> Result<Child, String> {
-    let resource_dir = app.path().resource_dir()
-        .map_err(|e| format!("No resource dir: {}", e))?;
-    let backend_entry = resource_dir.join("backend").join("index.js");
-    let node = which_node().ok_or("Node.js not found. Install Node.js 20+ to use Sam Local.")?;
-    let data_dir = app.path().app_data_dir()
-        .map_err(|e| format!("No app data dir: {}", e))?;
-    std::fs::create_dir_all(&data_dir).ok();
-
-    let mut cmd = Command::new(&node);
-    cmd.arg(&backend_entry)
-        .env("DATA_DIR", data_dir.join("store").to_str().unwrap_or(""))
-        .env("GROUPS_DIR", data_dir.join("groups").to_str().unwrap_or(""))
-        .env("LOGS_DIR", data_dir.join("logs").to_str().unwrap_or(""))
-        .env("PORT", "4100")
-        .env("NODE_ENV", "production");
-
-    // Pass Claude OAuth token to local backend so it can call Claude API
-    if let Some(creds) = read_creds_from_keyring(app) {
-        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", &creds.access_token);
-    }
-
-    let child = cmd.spawn()
-        .map_err(|e| format!("Failed to start backend: {}", e))?;
-
-    Ok(child)
-}
-
-fn which_node() -> Option<String> {
-    // Platform-specific hardcoded paths
-    #[cfg(target_os = "windows")]
-    let candidates: &[&str] = &[
-        "C:\\Program Files\\nodejs\\node.exe",
-        "C:\\Program Files (x86)\\nodejs\\node.exe",
-    ];
-    #[cfg(not(target_os = "windows"))]
-    let candidates: &[&str] = &[
-        "/usr/local/bin/node",
-        "/usr/bin/node",
-        "/opt/homebrew/bin/node",
-    ];
-
-    for path in candidates {
-        if std::path::Path::new(path).exists() {
-            return Some(path.to_string());
-        }
-    }
-
-    // Fall back to PATH lookup — `where` on Windows, `which` on Unix
-    #[cfg(target_os = "windows")]
-    let lookup = Command::new("where").arg("node").output().ok();
-    #[cfg(not(target_os = "windows"))]
-    let lookup = Command::new("which").arg("node").output().ok();
-
-    lookup
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.lines().next().unwrap_or("").trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-fn wait_for_backend(port: u16, timeout_secs: u64) -> bool {
-    let url = format!("http://localhost:{}/api/admin/status", port);
-    let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(timeout_secs) {
-        if reqwest::blocking::get(&url).map(|r| r.status().is_success()).unwrap_or(false) {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
-    false
-}
-
-#[tauri::command]
-fn run_shell(command: String) -> Result<String, String> {
-    let output = if cfg!(target_os = "windows") {
-        Command::new("cmd").args(["/C", &command]).output()
-    } else {
-        Command::new("sh").args(["-c", &command]).output()
-    };
-    match output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-            if out.status.success() { Ok(stdout) } else { Err(stderr) }
-        }
-        Err(e) => Err(format!("Failed: {}", e)),
+fn save_claude_creds(access_token: String, refresh_token: String, expires_at: u64) -> Result<String, String> {
+    let mut config = read_config();
+    config.access_token = access_token;
+    config.refresh_token = refresh_token;
+    config.expires_at = expires_at;
+    write_config(&config)?;
+    match push_token(&config) {
+        Ok(()) => Ok("Saved and synced".into()),
+        Err(_) => Ok("Saved locally".into()),
     }
 }
 
 #[tauri::command]
-fn check_chrome(port: u16) -> bool {
-    reqwest::blocking::get(format!("http://localhost:{}/json/version", port))
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+fn force_token_refresh() -> Result<serde_json::Value, String> {
+    let mut config = read_config();
+    if config.refresh_token.is_empty() { return Err("No refresh token".into()); }
+    let (a, r, e) = refresh_token_blocking(&config.refresh_token)?;
+    config.access_token = a;
+    config.refresh_token = r;
+    config.expires_at = e;
+    write_config(&config)?;
+    let synced = push_token(&config).is_ok();
+    let hrs = ((e.saturating_sub(now_ms())) as f64 / 3_600_000.0 * 10.0).round() / 10.0;
+    Ok(serde_json::json!({ "success": true, "hoursRemaining": hrs, "serverSynced": synced }))
 }
 
 #[tauri::command]
-fn get_mode() -> String {
-    let config_path = dirs::config_dir().map(|d| d.join("Sam").join("mode.json"));
-    if let Some(path) = config_path {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                return json["mode"].as_str().unwrap_or("setup").to_string();
-            }
-        }
-    }
-    "setup".to_string()
+fn push_token_now() -> Result<String, String> {
+    let config = read_config();
+    push_token(&config)?;
+    Ok("Synced".into())
 }
 
 #[tauri::command]
-fn set_mode(mode: String, url: Option<String>) -> Result<(), String> {
-    let config_dir = dirs::config_dir().map(|d| d.join("Sam")).ok_or("No config dir")?;
-    std::fs::create_dir_all(&config_dir).ok();
-    let config = serde_json::json!({ "mode": mode, "url": url.unwrap_or_default() });
-    std::fs::write(config_dir.join("mode.json"), config.to_string())
-        .map_err(|e| format!("Failed to save: {}", e))
+fn disconnect_claude() -> Result<(), String> {
+    let mut config = read_config();
+    config.access_token.clear();
+    config.refresh_token.clear();
+    config.expires_at = 0;
+    write_config(&config)
 }
 
-// ── App entry ──────────────────────────────────────────────────────────────
+// ── App ──
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_keyring::init())
-        .manage(BackendProcess(Mutex::new(None)))
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .invoke_handler(tauri::generate_handler![
-            run_shell, check_chrome, get_mode, set_mode,
-            save_claude_creds, save_bridge_config, get_claude_status,
-            detect_claude_creds, force_token_refresh, push_token_now, disconnect_claude,
+            get_server_url, get_bridge_token, save_config,
+            get_claude_status, detect_claude_creds, save_claude_creds,
+            force_token_refresh, push_token_now, disconnect_claude,
         ])
         .setup(|app| {
-            let handle = app.handle().clone();
+            let show = MenuItemBuilder::with_id("show", "Show").build(app)?;
+            let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+            let menu = MenuBuilder::new(app).item(&show).separator().item(&quit).build()?;
 
-            let app_menu = SubmenuBuilder::new(app, "Sam")
-                .item(&PredefinedMenuItem::about(app, Some("About Sam"), None)?)
-                .separator()
-                .item(&MenuItemBuilder::with_id("preferences", "Settings").accelerator("CmdOrCtrl+,").build(app)?)
-                .item(&MenuItemBuilder::with_id("check_updates", "Check for Updates...").build(app)?)
-                .separator()
-                .item(&MenuItemBuilder::with_id("switch_mode", "Switch Mode...").build(app)?)
-                .separator()
-                .item(&PredefinedMenuItem::hide(app, None)?)
-                .item(&PredefinedMenuItem::hide_others(app, None)?)
-                .item(&PredefinedMenuItem::show_all(app, None)?)
-                .separator()
-                .item(&PredefinedMenuItem::quit(app, None)?)
-                .build()?;
-
-            let edit_menu = SubmenuBuilder::new(app, "Edit")
-                .item(&PredefinedMenuItem::undo(app, None)?)
-                .item(&PredefinedMenuItem::redo(app, None)?)
-                .separator()
-                .item(&PredefinedMenuItem::cut(app, None)?)
-                .item(&PredefinedMenuItem::copy(app, None)?)
-                .item(&PredefinedMenuItem::paste(app, None)?)
-                .item(&PredefinedMenuItem::select_all(app, None)?)
-                .build()?;
-
-            let view_menu = SubmenuBuilder::new(app, "View")
-                .item(&MenuItemBuilder::with_id("reload", "Reload").accelerator("CmdOrCtrl+R").build(app)?)
-                .item(&MenuItemBuilder::with_id("dev_tools", "Developer Tools").accelerator("CmdOrCtrl+Alt+I").build(app)?)
-                .separator()
-                .item(&PredefinedMenuItem::fullscreen(app, None)?)
-                .build()?;
-
-            let window_menu = SubmenuBuilder::new(app, "Window")
-                .item(&PredefinedMenuItem::minimize(app, None)?)
-                .item(&PredefinedMenuItem::maximize(app, None)?)
-                .item(&PredefinedMenuItem::close_window(app, None)?)
-                .build()?;
-
-            let help_menu = SubmenuBuilder::new(app, "Help")
-                .item(&MenuItemBuilder::with_id("docs", "Documentation").build(app)?)
-                .item(&MenuItemBuilder::with_id("support", "Contact Support").build(app)?)
-                .separator()
-                .item(&MenuItemBuilder::with_id("website", "Visit samclawd.com").build(app)?)
-                .build()?;
-
-            let menu = MenuBuilder::new(app)
-                .item(&app_menu).item(&edit_menu).item(&view_menu)
-                .item(&window_menu).item(&help_menu)
-                .build()?;
-
-            app.set_menu(menu)?;
-
-            let menu_handle = handle.clone();
-            app.on_menu_event(move |_app, event| {
-                match event.id().0.as_str() {
-                    "preferences" => {
-                        if let Some(w) = menu_handle.get_webview_window("main") {
-                            let _ = w.eval("window.location.hash = '#settings'");
-                            let _ = w.show();
-                            let _ = w.set_focus();
-                        }
+            if let Some(tray) = app.tray_by_id("main") {
+                tray.set_menu(Some(menu))?;
+                let h = app.handle().clone();
+                tray.on_menu_event(move |_app, event| {
+                    match event.id().0.as_str() {
+                        "show" => { if let Some(w) = h.get_webview_window("main") { let _ = w.show(); let _ = w.set_focus(); } }
+                        "quit" => std::process::exit(0),
+                        _ => {}
                     }
-                    "switch_mode" => {
-                        let _ = set_mode("setup".into(), None);
-                        if let Some(w) = menu_handle.get_webview_window("main") {
-                            let _ = w.eval("window.location.reload()");
-                            let _ = w.show();
-                            let _ = w.set_focus();
-                        }
-                    }
-                    "reload" => {
-                        if let Some(w) = menu_handle.get_webview_window("main") {
-                            let _ = w.eval("window.location.reload()");
-                        }
-                    }
-                    "docs" => { let _ = open::that("https://docs.samclawd.com"); }
-                    "support" => { let _ = open::that("mailto:support@samclawd.com"); }
-                    "website" => { let _ = open::that("https://samclawd.com"); }
-                    _ => {}
-                }
-            });
-
-            // Start local backend if in local mode
-            let mode = get_mode();
-            if mode == "local" {
-                let backend_handle = handle.clone();
-                thread::spawn(move || {
-                    match start_backend(&backend_handle) {
-                        Ok(child) => {
-                            let state = backend_handle.state::<BackendProcess>();
-                            *state.0.lock().unwrap() = Some(child);
-                            if wait_for_backend(4100, 30) {
-                                if let Some(w) = backend_handle.get_webview_window("main") {
-                                    let _ = w.eval("window.location.href = 'http://localhost:4100'");
-                                }
-                            }
-                        }
-                        Err(e) => eprintln!("Backend start failed: {}", e),
+                });
+                let h2 = app.handle().clone();
+                tray.on_tray_icon_event(move |_tray, event| {
+                    if let TrayIconEvent::Click { .. } = event {
+                        if let Some(w) = h2.get_webview_window("main") { let _ = w.show(); let _ = w.set_focus(); }
                     }
                 });
             }
 
-            // Start background token sync loop
-            start_token_sync_loop(handle.clone());
-
-            // Push current token to server on startup — retry up to 5 times with backoff
-            {
-                let startup_handle = handle.clone();
-                thread::spawn(move || {
-                    thread::sleep(Duration::from_secs(3));
-                    let creds = match read_creds_from_keyring(&startup_handle) {
-                        Some(c) => c,
-                        None => return,
-                    };
-                    let config = match read_bridge_config_from_keyring(&startup_handle) {
-                        Some(c) => c,
-                        None => return,
-                    };
-
-                    let mut last_err = String::new();
-                    for attempt in 0u64..5 {
-                        if attempt > 0 {
-                            // Exponential backoff: 5s, 10s, 20s, 40s
-                            thread::sleep(Duration::from_secs(5 * (1 << (attempt - 1))));
-                        }
-                        match push_token_to_server_blocking(&config.server_url, &config.bridge_token, &creds) {
-                            Ok(()) => {
-                                let _ = startup_handle.emit("token-synced", creds.expires_at);
-                                return;
-                            }
-                            Err(e) => {
-                                eprintln!("[startup] Token push attempt {} failed: {}", attempt + 1, e);
-                                last_err = e;
-                            }
-                        }
+            if let Some(w) = app.get_webview_window("main") {
+                let wc = w.clone();
+                w.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = wc.hide();
                     }
-                    let _ = startup_handle.emit("token-sync-failed", last_err);
                 });
             }
 
-            // Hide to tray on close
-            let window = app.get_webview_window("main").unwrap();
-            let window_clone = window.clone();
-            window.on_window_event(move |event| {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let _ = window_clone.hide();
-                }
-            });
-
-            // Auto-update check
-            let update_handle = handle.clone();
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                if let Ok(updater) = update_handle.updater_builder().build() {
-                    if let Ok(Some(update)) = updater.check().await {
-                        let _ = update.download_and_install(|_, _| {}, || {}).await;
-                    }
-                }
-            });
-
+            start_sync_loop(app.handle().clone());
             Ok(())
         })
-        .on_window_event(|_app, event| {
-            if let tauri::WindowEvent::Destroyed = event {
-                if let Some(state) = _app.try_state::<BackendProcess>() {
-                    if let Ok(mut guard) = state.0.lock() {
-                        if let Some(ref mut child) = *guard {
-                            let _ = child.kill();
-                        }
-                    }
-                }
-            }
-        })
         .run(tauri::generate_context!())
-        .expect("error while running Sam");
+        .expect("error while running Sam Bridge");
 }
