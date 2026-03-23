@@ -27,14 +27,68 @@ jobs:
 
   build-macos:
     runs-on: macos-latest
+    env:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - uses: dtolnay/rust-toolchain@stable
+
+      # Install certificate
+      - name: Install Apple certificate
+        run: |
+          CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          echo "$APPLE_CERTIFICATE" | base64 --decode > $CERTIFICATE_PATH
+          security create-keychain -p "ci-keychain" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "ci-keychain" $KEYCHAIN_PATH
+          security import $CERTIFICATE_PATH -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple: -k "ci-keychain" $KEYCHAIN_PATH
+          security list-keychains -d user -s $KEYCHAIN_PATH login.keychain-db
+
       - run: npm install
       - run: npm run tauri build
+
+      # Sign with hardened runtime + timestamp
+      - name: Sign app
+        run: |
+          codesign --force --deep \
+            --sign "Developer ID Application: Expert Systems BV (57ZCLWYR24)" \
+            --options runtime --timestamp \
+            "src-tauri/target/release/bundle/macos/Sam Bridge.app"
+
+      # Rebuild DMG with signed app
+      - name: Create signed DMG
+        run: |
+          rm -f src-tauri/target/release/bundle/dmg/*.dmg
+          hdiutil create -volname "Sam Bridge" \
+            -srcfolder "src-tauri/target/release/bundle/macos/Sam Bridge.app" \
+            -ov -format UDZO \
+            "src-tauri/target/release/bundle/dmg/Sam.Bridge_aarch64.dmg"
+          codesign --force \
+            --sign "Developer ID Application: Expert Systems BV (57ZCLWYR24)" \
+            --timestamp \
+            "src-tauri/target/release/bundle/dmg/Sam.Bridge_aarch64.dmg"
+
+      # Notarize
+      - name: Notarize DMG
+        run: |
+          xcrun notarytool submit \
+            "src-tauri/target/release/bundle/dmg/Sam.Bridge_aarch64.dmg" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_PASSWORD" \
+            --wait
+          xcrun stapler staple \
+            "src-tauri/target/release/bundle/dmg/Sam.Bridge_aarch64.dmg"
+
       - uses: actions/upload-artifact@v4
         with:
           name: sam-bridge-macos-dmg
